@@ -3,7 +3,6 @@ FROM debian:stable
 RUN apt-get update && apt-get install -y \
     build-essential \
     clang-format \
-    cmake \
     curl \
     gcc \
     gdb \
@@ -24,6 +23,8 @@ RUN apt-get update && apt-get install -y \
     valgrind \
     zip \
     && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages --no-cache-dir "cmake>=4.3,<5"
 
 ENV VCPKG_FORCE_SYSTEM_BINARIES=1
 

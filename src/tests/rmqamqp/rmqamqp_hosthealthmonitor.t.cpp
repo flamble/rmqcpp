@@ -236,6 +236,17 @@ TEST_F(HostHealthMonitorTests, HealthyHostResumesConnections)
     stepOnePollInterval();
 }
 
+TEST_F(HostHealthMonitorTests, FirstCheckFiresImmediately)
+{
+    d_configurableHealthChecker.d_nextResult = true;
+
+    EXPECT_CALL(*d_connection, resumeReceiveChannels(true)).Times(1);
+    EXPECT_CALL(*d_connection, pauseReceiveChannels(_)).Times(0);
+
+    // First check is scheduled with zero delay, so stepping by zero fires it.
+    d_timerFactory->step_time(bsls::TimeInterval(0));
+}
+
 TEST_F(HostHealthMonitorTests, UnhealthyHostPausesConnections)
 {
     d_configurableHealthChecker.d_nextResult = false;
@@ -244,6 +255,56 @@ TEST_F(HostHealthMonitorTests, UnhealthyHostPausesConnections)
     EXPECT_CALL(*d_connection, resumeReceiveChannels(_)).Times(0);
 
     stepOnePollInterval();
+}
+
+TEST_F(HostHealthMonitorTests, RegisterOnUnhealthyHostPausesImmediately)
+{
+    // Drive one check that marks the host UNHEALTHY.
+    d_configurableHealthChecker.d_nextResult = false;
+
+    EXPECT_CALL(*d_connection, pauseReceiveChannels(true)).Times(1);
+    stepAndClear();
+
+    bsl::shared_ptr<MockConnection> lateConn = makeConnection("late-unhealthy");
+
+    EXPECT_CALL(*lateConn, pauseReceiveChannels(true)).Times(1);
+    EXPECT_CALL(*lateConn, resumeReceiveChannels(_)).Times(0);
+
+    d_monitor->registerConnection(bsl::weak_ptr<rmqamqp::Connection>(lateConn));
+}
+
+TEST_F(HostHealthMonitorTests, RegisterOnHealthyHostResumesImmediately)
+{
+    // Drive one check that marks the host HEALTHY.
+    d_configurableHealthChecker.d_nextResult = true;
+
+    EXPECT_CALL(*d_connection, resumeReceiveChannels(true)).Times(1);
+    stepAndClear();
+
+    bsl::shared_ptr<MockConnection> lateConn = makeConnection("late-healthy");
+
+    EXPECT_CALL(*lateConn, resumeReceiveChannels(true)).Times(1);
+    EXPECT_CALL(*lateConn, pauseReceiveChannels(_)).Times(0);
+
+    d_monitor->registerConnection(bsl::weak_ptr<rmqamqp::Connection>(lateConn));
+}
+
+TEST_F(HostHealthMonitorTests, RegisterBeforeFirstCheckPausesImmediately)
+{
+    // No check has run yet, so the monitor's fail-safe default (UNHEALTHY)
+    // applies.
+    bsl::shared_ptr<HostHealthMonitor> monitor =
+        bsl::make_shared<HostHealthMonitor>(d_config, d_metricPublisher.get());
+    monitor->start(d_timerFactory);
+
+    EXPECT_CALL(*d_metricPublisher, publishGauge(_, _, _)).Times(AtLeast(0));
+
+    bsl::shared_ptr<MockConnection> earlyConn = makeConnection("early");
+
+    EXPECT_CALL(*earlyConn, pauseReceiveChannels(true)).Times(1);
+    EXPECT_CALL(*earlyConn, resumeReceiveChannels(_)).Times(0);
+
+    monitor->registerConnection(bsl::weak_ptr<rmqamqp::Connection>(earlyConn));
 }
 
 TEST_F(HostHealthMonitorTests, ExpiredConnectionIsRemovedAndNotUsed)

@@ -35,6 +35,17 @@ BALL_LOG_SET_NAMESPACE_CATEGORY("RMQAMQP.HOSTHEALTHMONITOR")
 
 const bool RESPECT_HOST_HEALTH = true;
 
+void syncReceiveChannelsToHostHealth(rmqamqp::Connection& connection,
+                                     HostHealthMonitor::HostHealth health)
+{
+    if (health == HostHealthMonitor::HEALTHY) {
+        connection.resumeReceiveChannels(RESPECT_HOST_HEALTH);
+    }
+    else if (health == HostHealthMonitor::UNHEALTHY) {
+        connection.pauseReceiveChannels(RESPECT_HOST_HEALTH);
+    }
+}
+
 } // namespace
 
 HostHealthMonitor::HostHealthMonitor(
@@ -42,6 +53,9 @@ HostHealthMonitor::HostHealthMonitor(
     rmqp::MetricPublisher* metricPublisher)
 : d_hostHealthConfig(hostHealthConfig)
 , d_currentTries(0)
+// Fail-safe: assume unhealthy until the first check, so connections that
+// register beforehand start paused.
+, d_latestHealthCheckResult(UNHEALTHY)
 , d_timer()
 , d_metricPublisher(metricPublisher)
 {
@@ -65,7 +79,9 @@ void HostHealthMonitor::start(
         bdlf::BindUtil::bind(&HostHealthMonitor::handleTimerFired,
                              weak_from_this(),
                              bdlf::PlaceHolders::_1));
-    scheduleNextCheck();
+    // Fire the first check immediately; checkHealth() then reschedules at
+    // pollInterval.
+    d_timer->reset(bsls::TimeInterval(0));
 }
 
 void HostHealthMonitor::stop()
@@ -83,6 +99,18 @@ void HostHealthMonitor::registerConnection(
 
     d_metricPublisher->publishGauge(Metrics::HEALTH_AWARE_VHOSTS,
                                     static_cast<double>(d_connections.size()));
+
+    // Bring the connection into the current known state now, rather than
+    // waiting for the next poll.
+    bsl::shared_ptr<rmqamqp::Connection> connection = conn.lock();
+    if (connection) {
+        BALL_LOG_INFO << "healthState=" << d_latestHealthCheckResult
+                      << " action="
+                      << (d_latestHealthCheckResult == HEALTHY ? "resume"
+                                                               : "pause")
+                      << " reason=newly-registered-connection";
+        syncReceiveChannelsToHostHealth(*connection, d_latestHealthCheckResult);
+    }
 }
 
 void HostHealthMonitor::handleTimerFired(
@@ -121,9 +149,9 @@ void HostHealthMonitor::checkHealth()
             bsls::SystemTime::nowMonotonicClock();
         const double durationMs = (endTime - startTime).totalMilliseconds();
 
-        BALL_LOG_INFO << "Health check completed in " << durationMs
-                      << " ms with result: " << healthCheckerResult
-                      << ". Set health state to: " << result;
+        BALL_LOG_DEBUG << "event=health-check-completed durationMs="
+                       << durationMs << " result=" << healthCheckerResult
+                       << " healthState=" << result;
 
         d_metricPublisher->publishSummary(Metrics::HEALTH_CHECK_DURATION_MS,
                                           durationMs);
@@ -131,23 +159,24 @@ void HostHealthMonitor::checkHealth()
         const double HEALTHCHECK_DURATION_REPORTING_THRESHOLD =
             bsl::min(d_hostHealthConfig.pollInterval() * 1000.0 * 0.8, 1000.0);
         if (durationMs > HEALTHCHECK_DURATION_REPORTING_THRESHOLD) {
-            BALL_LOG_WARN << "Host health check took " << durationMs
-                          << " ms which exceeds the threshold of "
-                          << HEALTHCHECK_DURATION_REPORTING_THRESHOLD << " ms.";
+            BALL_LOG_WARN << "event=health-check-duration-exceeds-threshold "
+                             "durationMs="
+                          << durationMs << " thresholdMs="
+                          << HEALTHCHECK_DURATION_REPORTING_THRESHOLD;
             d_metricPublisher->publishCounter(
                 Metrics::HEALTH_CHECK_BLOCKED_EVENT_LOOP, 1.0);
         }
     }
     catch (const bsl::exception& e) {
-        BALL_LOG_ERROR << "Host health check failed with exception: "
-                       << e.what();
+        BALL_LOG_ERROR << "event=health-check-failed exception=\"" << e.what()
+                       << "\"";
         result = RETRY;
 
         d_metricPublisher->publishCounter(Metrics::HEALTH_CHECK_FAILURES_TOTAL,
                                           1.0);
     }
     catch (...) {
-        BALL_LOG_ERROR << "Host health check failed with unknown exception.";
+        BALL_LOG_ERROR << "event=health-check-failed exception=unknown";
         result = RETRY;
 
         d_metricPublisher->publishCounter(Metrics::HEALTH_CHECK_FAILURES_TOTAL,
@@ -156,9 +185,9 @@ void HostHealthMonitor::checkHealth()
 
     if (result == RETRY) {
         if (d_currentTries++ > d_hostHealthConfig.maxRetriesOnFailure()) {
-            BALL_LOG_ERROR << "Exceeded max retries on failure of "
+            BALL_LOG_ERROR << "event=max-retries-exceeded maxRetries="
                            << d_hostHealthConfig.maxRetriesOnFailure()
-                           << ". Marking host as UNHEALTHY.";
+                           << " action=mark-unhealthy";
             result = UNHEALTHY;
 
             d_metricPublisher->publishGauge(
@@ -166,12 +195,12 @@ void HostHealthMonitor::checkHealth()
                 static_cast<double>(d_currentTries));
         }
         else {
-            BALL_LOG_WARN << "Current tries " << d_currentTries
-                          << " do not exceed max retries on failure of "
+            BALL_LOG_WARN << "event=health-check-retry currentTries="
+                          << d_currentTries << " maxRetries="
                           << d_hostHealthConfig.maxRetriesOnFailure()
-                          << ". Will retry after "
+                          << " retryAfterSeconds="
                           << d_hostHealthConfig.pollInterval()
-                          << " seconds. Will NOT pause the consumers yet.";
+                          << " action=none";
 
             if (d_metricPublisher) {
                 d_metricPublisher->publishGauge(
@@ -190,8 +219,18 @@ void HostHealthMonitor::processHealthResult(HostHealth result)
 {
     d_currentTries = 0;
 
-    BALL_LOG_DEBUG << (result == HEALTHY ? "Resuming" : "Pausing")
-                   << " host health aware consumers.";
+    if (result != d_latestHealthCheckResult) {
+        BALL_LOG_INFO << "event=health-state-changed previousHealthState="
+                      << d_latestHealthCheckResult << " healthState=" << result;
+    }
+
+    // Cache for registerConnection. RETRY returns early, so this only ever
+    // holds HEALTHY or UNHEALTHY.
+    d_latestHealthCheckResult = result;
+
+    BALL_LOG_DEBUG << "healthState=" << result
+                   << " action=" << (result == HEALTHY ? "resume" : "pause")
+                   << " target=health-aware-consumers";
 
     const double statusValue = (result == HEALTHY) ? 1.0 : 0.0;
     d_metricPublisher->publishGauge(Metrics::HEALTH_CHECK_STATUS, statusValue);
@@ -225,12 +264,7 @@ void HostHealthMonitor::processHealthResult(HostHealth result)
             continue;
         }
 
-        if (result == HEALTHY) {
-            connection->resumeReceiveChannels(RESPECT_HOST_HEALTH);
-        }
-        else {
-            connection->pauseReceiveChannels(RESPECT_HOST_HEALTH);
-        }
+        syncReceiveChannelsToHostHealth(*connection, result);
 
         ++conn;
     }
